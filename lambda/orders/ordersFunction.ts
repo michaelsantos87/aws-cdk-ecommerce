@@ -5,7 +5,7 @@ import {
 } from "aws-lambda";
 import { Product, ProductRepository } from "/opt/nodejs/productsLayer";
 import { Order, OrderRepository } from "opt/nodejs/ordersLayer";
-import { DynamoDB, SNS } from "aws-sdk";
+import { DynamoDB, EventBridge, SNS } from "aws-sdk";
 import * as AWSXRay from "aws-xray-sdk";
 import {
   CarrierType,
@@ -27,9 +27,11 @@ AWSXRay.captureAWS(require("aws-sdk"));
 const ordersDdb = process.env.ORDERS_DDB!;
 const productsDdb = process.env.PRODUCTS_DDB!;
 const orderEventsTopicArn = process.env.ORDER_EVENTS_TOPIC_ARN!;
+const auditBusName = process.env.AUDIT_BUS_NAME!;
 
 const ddbClient = new DynamoDB.DocumentClient();
 const snsClient = new SNS();
+const eventBridgetClient = new EventBridge();
 
 const orderRepository = new OrderRepository(ddbClient, ordersDdb);
 const productRepository = new ProductRepository(ddbClient, productsDdb);
@@ -118,6 +120,25 @@ export async function handler(
         body: JSON.stringify(convertToOrderResponse(order)),
       };
     } else {
+      console.error("Some product was not found");
+      const result = await eventBridgetClient
+        .putEvents({
+          Entries: [
+            {
+              Source: "app.order",
+              EventBusName: auditBusName,
+              DetailType: "order",
+              Time: new Date(),
+              Detail: JSON.stringify({
+                reason: "PRODUCT_NOT_FOUND",
+                orderRequest: orderRequest,
+              }),
+            },
+          ],
+        })
+        .promise();
+      console.log(result);
+
       return {
         statusCode: 404,
         body: "Some product was not found",
