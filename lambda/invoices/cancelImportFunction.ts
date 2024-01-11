@@ -3,14 +3,29 @@ import {
   APIGatewayProxyResult,
   Context,
 } from "aws-lambda";
+import { ApiGatewayManagementApi, DynamoDB } from "aws-sdk";
 import * as AWSXRay from "aws-xray-sdk";
-// import { DynamoDB } from "aws-sdk";
+import {
+  InvoiceTransactionRepository,
+  InvoiceTransactionStatus,
+} from "opt/nodejs/invoiceTransaction";
+import { InvoiceWSService } from "opt/nodejs/invoiceWSConnection";
 
 AWSXRay.captureAWS(require("aws-sdk"));
 
-// const eventsDdb = process.env.EVENTS_DDB!;
-// const ddbClient = new DynamoDB.DocumentClient();
-// const orderEventsRepository = new OrderEventRepository(ddbClient, eventsDdb);
+const invoicesDdb = process.env.INVOICE_DDB!;
+const invoicesWsApiEndPoint = process.env.INVOICE_WSAPI_ENDPOINT!.substring(6);
+
+const ddbClient = new DynamoDB.DocumentClient();
+const apigwManagementApi = new ApiGatewayManagementApi({
+  endpoint: invoicesWsApiEndPoint,
+});
+
+const invoiceTransactionRepository = new InvoiceTransactionRepository(
+  ddbClient,
+  invoicesDdb
+);
+const invoiceWSService = new InvoiceWSService(apigwManagementApi);
 
 export async function handler(
   event: APIGatewayProxyEvent,
@@ -18,41 +33,54 @@ export async function handler(
 ): Promise<APIGatewayProxyResult> {
   console.log(event);
 
-  // const apiRequestId = event.requestContext.requestId;
-  // const lambdaRequestId = context.awsRequestId;
+  const transactionId = JSON.parse(event.body!).transactionId as string;
+  const lambdaRequestId = context.awsRequestId;
+  const connectionId = event.requestContext.connectionId!;
 
-  // const email = event.queryStringParameters!.email!;
-  // const eventType = event.queryStringParameters!.eventType;
+  console.log(
+    `ConnectionId: ${connectionId} - Lambda RequestId: ${lambdaRequestId}`
+  );
 
-  // console.log(
-  //   `API Gateway RequestId: ${apiRequestId} - Lambda RequestId: ${lambdaRequestId}`
-  // );
+  try {
+    const invoiceTransaction =
+      await invoiceTransactionRepository.getInvoiceTransaction(transactionId);
 
-  // if (eventType) {
-  //   const orderEvents =
-  //     await orderEventsRepository.getOrderEventsByEmailAndEventType(
-  //       email,
-  //       eventType
-  //     );
+    if (
+      invoiceTransaction.transactionStatus ===
+      InvoiceTransactionStatus.GENERATED
+    ) {
+      await Promise.all([
+        invoiceWSService.sendInvoiceStatus(
+          transactionId,
+          invoiceTransaction.connectionId,
+          InvoiceTransactionStatus.CANCELLED
+        ),
+        invoiceTransactionRepository.updateInvoiceTransaction(
+          transactionId,
+          InvoiceTransactionStatus.CANCELLED
+        ),
+      ]);
+    } else {
+      await invoiceWSService.sendInvoiceStatus(
+        transactionId,
+        invoiceTransaction.connectionId,
+        invoiceTransaction.transactionStatus
+      );
+      console.error("Can't cancel an ongoing process");
+    }
+  } catch (error) {
+    console.error((<Error>error).message);
+    console.error(
+      `Invoice transaction not found - TransactionId: ${transactionId}`
+    );
+    await invoiceWSService.sendInvoiceStatus(
+      transactionId,
+      connectionId,
+      InvoiceTransactionStatus.NOT_FOUND
+    );
+  }
 
-  //   return {
-  //     statusCode: 200,
-  //     body: JSON.stringify({
-  //       message: JSON.stringify(convertOrderEvents(orderEvents)),
-  //     }),
-  //   };
-  // } else {
-  //   const orderEvents = await orderEventsRepository.getOrderEventsByEmail(
-  //     email
-  //   );
-
-  //   return {
-  //     statusCode: 200,
-  //     body: JSON.stringify({
-  //       message: JSON.stringify(convertOrderEvents(orderEvents)),
-  //     }),
-  //   };
-  // }
+  await invoiceWSService.disconnectClient(transactionId);
 
   return {
     statusCode: 200,

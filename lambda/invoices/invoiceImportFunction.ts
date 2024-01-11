@@ -1,13 +1,12 @@
 import { Context, S3Event, S3EventRecord } from "aws-lambda";
 import * as AWSXRay from "aws-xray-sdk";
 import { ApiGatewayManagementApi, DynamoDB, S3 } from "aws-sdk";
-import { v4 as uuid } from "uuid";
 import {
   InvoiceTransactionStatus,
   InvoiceTransactionRepository,
 } from "opt/nodejs/invoiceTransaction";
 import { InvoiceWSService } from "opt/nodejs/invoiceWSConnection";
-import { InvoiceRepository } from "opt/nodejs/invoiceRepository";
+import { InvoiceFile, InvoiceRepository } from "opt/nodejs/invoiceRepository";
 
 AWSXRay.captureAWS(require("aws-sdk"));
 
@@ -36,52 +35,8 @@ export async function handler(event: S3Event, context: Context): Promise<void> {
     promises.push(processRecord(record));
   });
 
+  await Promise.all(promises);
   return;
-  // const lambdaRequestId = context.awsRequestId;
-  // const connectionId = event.requestContext.connectionId!;
-
-  // console.log(
-  //   `ConnectionId: ${connectionId} - Lambda RequestId: ${lambdaRequestId}`
-  // );
-
-  // const key = uuid();
-  // const expires = 300;
-
-  // const signedUrlPut = await s3Client.getSignedUrlPromise("putObject", {
-  //   Bucket: bucketName,
-  //   Key: key,
-  //   Expires: expires,
-  // });
-
-  // // Create invoice transaction
-  // const timestamp = Date.now();
-  // const ttl = ~~(timestamp / 1000 + 60 * 2);
-
-  // await invoiceTransactionRepository.createInvoiceTransaction({
-  //   pk: "#transaction",
-  //   sk: key,
-  //   ttl: ttl,
-  //   requestId: lambdaRequestId,
-  //   transactionStatus: InvoiceTransactionStatus.GENERATED,
-  //   timestamp: timestamp,
-  //   expiresIn: expires,
-  //   connectionId: connectionId,
-  //   endpoint: invoicesWsApiEndPoint,
-  // });
-
-  // // Send URL back to WS connected client
-  // const postData = JSON.stringify({
-  //   url: signedUrlPut,
-  //   expires: expires,
-  //   transactionId: key,
-  // });
-
-  // await invoiceWSService.sendData(connectionId, postData);
-
-  // return {
-  //   statusCode: 200,
-  //   body: "Ok",
-  // };
 }
 
 async function processRecord(record: S3EventRecord) {
@@ -105,13 +60,80 @@ async function processRecord(record: S3EventRecord) {
           InvoiceTransactionStatus.RECEIVED
         ),
       ]);
+
+      const object = await s3Client
+        .getObject({
+          Key: key,
+          Bucket: record.s3.bucket.name,
+        })
+        .promise();
+
+      const invoice = JSON.parse(object.Body!.toString("utf-8")) as InvoiceFile;
+      console.log(invoice);
+
+      if (invoice.invoiceNumber.length && invoice.invoiceNumber.length >= 5) {
+        const createInvoicePromise = invoiceRepository.create({
+          pk: `#invoice_${invoice.customerName}`,
+          sk: invoice.invoiceNumber,
+          ttl: 0,
+          totalValue: invoice.totalValue,
+          productId: invoice.productId,
+          quantity: invoice.quantity,
+          transactionId: key,
+          createdAt: Date.now(),
+        });
+
+        const deleteObjectPromise = s3Client
+          .deleteObject({
+            Key: key,
+            Bucket: record.s3.bucket.name,
+          })
+          .promise();
+
+        const updateInvoicePromise =
+          invoiceTransactionRepository.updateInvoiceTransaction(
+            key,
+            InvoiceTransactionStatus.PROCESSED
+          );
+        const sendStatusPromise = invoiceWSService.sendInvoiceStatus(
+          key,
+          invoiceTransaction.connectionId,
+          InvoiceTransactionStatus.PROCESSED
+        );
+
+        await Promise.all([
+          createInvoicePromise,
+          deleteObjectPromise,
+          updateInvoicePromise,
+          sendStatusPromise,
+        ]);
+      } else {
+        console.log(
+          `Invoice import failed - non valid invoice number - TransactionId: ${key}`
+        );
+
+        const updateInvoicePromise =
+          invoiceTransactionRepository.updateInvoiceTransaction(
+            key,
+            InvoiceTransactionStatus.NON_VALID_INVOICE_NUMBER
+          );
+        const sendStatusPromise = invoiceWSService.sendInvoiceStatus(
+          key,
+          invoiceTransaction.connectionId,
+          InvoiceTransactionStatus.NON_VALID_INVOICE_NUMBER
+        );
+
+        await Promise.all([updateInvoicePromise, sendStatusPromise]);
+
+        await invoiceWSService.disconnectClient(key);
+      }
     } else {
       await invoiceWSService.sendInvoiceStatus(
         key,
         invoiceTransaction.connectionId,
         invoiceTransaction.transactionStatus
       );
-      console.error("Nov valid transaction status");
+      console.error("Not valid transaction status");
       return;
     }
   } catch (error) {
