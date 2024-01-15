@@ -4,9 +4,10 @@ import {
   Context,
 } from "aws-lambda";
 import { Product, ProductRepository } from "/opt/nodejs/productsLayer";
-import { DynamoDB, Lambda } from "aws-sdk";
+import { CognitoIdentityServiceProvider, DynamoDB, Lambda } from "aws-sdk";
 import { ProductEvent, ProductEventType } from "/opt/nodejs/productEventsLayer";
 import * as AWSXRay from "aws-xray-sdk";
+import { AuthInfoService } from "opt/nodejs/authUserInfo";
 
 AWSXRay.captureAWS(require("aws-sdk"));
 
@@ -14,7 +15,10 @@ const productsDdb = process.env.PRODUCTS_DDB!;
 const ddbClient = new DynamoDB.DocumentClient();
 const productEventsFunctionName = process.env.PRODUCT_EVENTS_FUNCTION_NAME!;
 const lambdaClient = new Lambda();
+const cognitoIdentityServiceProvider = new CognitoIdentityServiceProvider();
+
 const productRepository = new ProductRepository(ddbClient, productsDdb);
+const authInfoService = new AuthInfoService(cognitoIdentityServiceProvider);
 
 export async function handler(
   event: APIGatewayProxyEvent,
@@ -27,6 +31,10 @@ export async function handler(
     `API Gateway RequestId: ${apiRequestId} - Lambda RequestId: ${lambdaRequestId}`
   );
 
+  const userEmail = await authInfoService.getUserInfo(
+    event.requestContext.authorizer
+  );
+
   const method = event.httpMethod;
   if (event.resource === "/products") {
     if (method === "POST") {
@@ -37,7 +45,7 @@ export async function handler(
       const response = await sendProductEvent(
         productCreated,
         ProductEventType.CREATED,
-        "test@test.com",
+        userEmail,
         lambdaRequestId
       );
       console.log(response);
@@ -62,7 +70,7 @@ export async function handler(
         const response = await sendProductEvent(
           productUpdated,
           ProductEventType.UPDATED,
-          "test1@test.com",
+          userEmail,
           lambdaRequestId
         );
         console.log(response);
@@ -85,7 +93,7 @@ export async function handler(
         const response = await sendProductEvent(
           product,
           ProductEventType.DELETED,
-          "test2@test.com",
+          userEmail,
           lambdaRequestId
         );
         console.log(response);

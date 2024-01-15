@@ -8,6 +8,7 @@ import { OrdersAppStack } from "../lib/ordersApp-stack";
 import { InvoiceWSApiStack } from "../lib/invoiceWSApi-stack";
 import { InvoicesAppLayersStack } from "../lib/invoicesAppLayers-stack";
 import { AuditEventBusStack } from "../lib/auditEventBus-stack";
+import { AuthLayersStack } from "../lib/authLayers-stack";
 
 const app = new cdk.App();
 
@@ -27,6 +28,11 @@ const auditEventBusStack = new AuditEventBusStack(app, "AuditEvents", {
     team: "AppCode",
   },
   env: env,
+});
+
+const authLayersStack = new AuthLayersStack(app, "AuthLayers", {
+  tags,
+  env,
 });
 
 const productsAppLayersStack = new ProductsAppLayersStack(
@@ -49,6 +55,7 @@ const productsAppStack = new ProductsAppStack(app, "ProductsApp", {
   env,
 });
 productsAppStack.addDependency(productsAppLayersStack);
+productsAppStack.addDependency(authLayersStack);
 productsAppStack.addDependency(eventsDdbStack);
 
 const ordersAppLayersStack = new OrdersAppLayersStack(app, "OrdersAppLayers", {

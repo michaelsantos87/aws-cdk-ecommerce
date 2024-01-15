@@ -5,7 +5,12 @@ import {
 } from "aws-lambda";
 import { Product, ProductRepository } from "/opt/nodejs/productsLayer";
 import { Order, OrderRepository } from "opt/nodejs/ordersLayer";
-import { DynamoDB, EventBridge, SNS } from "aws-sdk";
+import {
+  CognitoIdentityServiceProvider,
+  DynamoDB,
+  EventBridge,
+  SNS,
+} from "aws-sdk";
 import * as AWSXRay from "aws-xray-sdk";
 import {
   CarrierType,
@@ -20,6 +25,7 @@ import {
   OrderEventType,
   Envelope,
 } from "opt/nodejs/orderEventsLayer";
+import { AuthInfoService } from "opt/nodejs/authUserInfo";
 import { v4 as uuid } from "uuid";
 
 AWSXRay.captureAWS(require("aws-sdk"));
@@ -32,9 +38,11 @@ const auditBusName = process.env.AUDIT_BUS_NAME!;
 const ddbClient = new DynamoDB.DocumentClient();
 const snsClient = new SNS();
 const eventBridgetClient = new EventBridge();
+const cognitoIdentityServiceProvider = new CognitoIdentityServiceProvider();
 
 const orderRepository = new OrderRepository(ddbClient, ordersDdb);
 const productRepository = new ProductRepository(ddbClient, productsDdb);
+const authInfoService = new AuthInfoService(cognitoIdentityServiceProvider);
 
 export async function handler(
   event: APIGatewayProxyEvent,
@@ -48,51 +56,81 @@ export async function handler(
     `API Gateway RequestId: ${apiRequestId} - Lambda RequestId: ${lambdaRequestId}`
   );
 
+  const isUserAdmin = authInfoService.isUserAdmin(
+    event.requestContext.authorizer
+  );
+  const authenticatedUser = await authInfoService.getUserInfo(event);
+
   if (method === "GET") {
     if (event.queryStringParameters) {
       console.log("GET Filter /orders");
       const email = event.queryStringParameters!.email;
       const orderId = event.queryStringParameters!.orderId;
+      const authenticatedUser = await authInfoService.getUserInfo(event);
 
       if (email) {
-        if (orderId) {
-          // Get one order from an user
-          try {
-            const orders = await orderRepository.getOrder(email, orderId);
+        if (authenticatedUser === email || isUserAdmin) {
+          if (orderId) {
+            // Get one order from an user
+            try {
+              const orders = await orderRepository.getOrder(email, orderId);
+              return {
+                statusCode: 200,
+                body: JSON.stringify(convertToOrderResponse(orders)),
+              };
+            } catch (error) {
+              console.log((<Error>error).message);
+              return {
+                statusCode: 404,
+                body: (<Error>error).message,
+              };
+            }
+          } else {
+            const orders = await orderRepository.getOrdersByEmail(email);
             return {
               statusCode: 200,
-              body: JSON.stringify(convertToOrderResponse(orders)),
-            };
-          } catch (error) {
-            console.log((<Error>error).message);
-            return {
-              statusCode: 404,
-              body: (<Error>error).message,
+              body: JSON.stringify(orders.map(convertToOrderResponse)),
             };
           }
         } else {
-          const orders = await orderRepository.getOrdersByEmail(email);
           return {
-            statusCode: 200,
-            body: JSON.stringify(orders.map(convertToOrderResponse)),
+            statusCode: 403,
+            body: "Not Authorized",
           };
         }
       }
     } else {
       console.log("GET All /orders");
 
-      // Get all orders
-      const orders = await orderRepository.getAllOrders();
+      if (isUserAdmin) {
+        // Get all orders
+        const orders = await orderRepository.getAllOrders();
 
-      return {
-        statusCode: 200,
-        body: JSON.stringify(orders.map(convertToOrderResponse)),
-      };
+        return {
+          statusCode: 200,
+          body: JSON.stringify(orders.map(convertToOrderResponse)),
+        };
+      } else {
+        return {
+          statusCode: 403,
+          body: "Not Authorized",
+        };
+      }
     }
   } else if (method === "POST") {
     console.log("POST /orders");
 
     const orderRequest = JSON.parse(event.body!) as OrderRequest;
+
+    if (!isUserAdmin) {
+      orderRequest.email = authenticatedUser;
+    } else if (orderRequest.email === null) {
+      return {
+        statusCode: 400,
+        body: "Missing the order owner email",
+      };
+    }
+
     const products = await productRepository.getProductsById(
       orderRequest.productIds
     );
@@ -148,6 +186,13 @@ export async function handler(
     console.log("DELETE /orders");
     const email = event.queryStringParameters!.email!;
     const orderId = event.queryStringParameters!.orderId!;
+
+    if (!isUserAdmin || email !== authenticatedUser) {
+      return {
+        statusCode: 403,
+        body: "Not Authorized",
+      };
+    }
 
     try {
       const orderDeleted = await orderRepository.deleteOrder(email, orderId);
